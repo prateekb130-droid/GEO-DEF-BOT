@@ -201,7 +201,7 @@ Articles:
 {news}"""
 
     last_error = None
-    models_to_try = ["gemini-2.5-flash", "gemini-3.5-flash"]
+    models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash"]
 
     for model_name in models_to_try:
         for attempt in range(2):
