@@ -1,5 +1,6 @@
-import feedparser, os, smtplib, re, trafilatura, time
+import feedparser, os, smtplib, re, trafilatura, time, html
 from google import genai
+from google.genai import errors as genai_errors
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta, timezone
 from time import mktime
@@ -12,6 +13,13 @@ FEEDS = {
 }
 
 IST_OFFSET = timedelta(hours=5, minutes=30)
+
+# Models are tried in this order. Each model gets several attempts with a
+# growing wait in between, so a short "high demand" (503) spike doesn't
+# kill the whole run.
+MODELS_TO_TRY = ["gemini-3.6-flash", "gemini-3.5-flash", "gemini-3.1-flash-lite"]
+RETRY_DELAYS = [0, 10, 30, 60]  # seconds to wait before attempt 1, 2, 3, 4
+
 
 def get_target_date_ist():
     now_ist = datetime.now(timezone.utc) + IST_OFFSET
@@ -153,7 +161,7 @@ def get_news_articles():
             pass
     return articles
 
-def build_news_text(articles, max_articles=15):
+def select_relevant(articles, max_articles=15):
     for a in articles:
         a['score'] = ssb_score(a['title'], a['content'])
 
@@ -162,7 +170,9 @@ def build_news_text(articles, max_articles=15):
     relevant = [a for a in articles if a['score'] > 0][:max_articles]
     if not relevant:
         relevant = articles[:max_articles]
+    return relevant
 
+def build_news_text(relevant):
     data = ""
     for a in relevant:
         data += f"Source: {a['source']}\nTitle: {a['title']}\nLink: {a['link']}\nContent: {a['content']}\n\n"
@@ -201,28 +211,63 @@ Articles:
 {news}"""
 
     last_error = None
-    models_to_try = ["gemini-3.6-flash", "gemini-3.5-flash"]
 
-    for model_name in models_to_try:
-        for attempt in range(2):
+    for model_name in MODELS_TO_TRY:
+        for attempt, delay in enumerate(RETRY_DELAYS, start=1):
+            if delay:
+                time.sleep(delay)
             try:
                 response = client.models.generate_content(
                     model=model_name,
                     contents=prompt
                 )
-                return response.text
+                if response.text:
+                    return response.text
+                last_error = RuntimeError(f"{model_name} returned an empty response")
+                print(f"{model_name} attempt {attempt}: empty response")
+
+            except genai_errors.ServerError as e:
+                # 500/503: Google is busy. Waiting and retrying usually works.
+                last_error = e
+                print(f"{model_name} attempt {attempt}/{len(RETRY_DELAYS)}: server busy ({e.code})")
+
+            except genai_errors.ClientError as e:
+                last_error = e
+                print(f"{model_name} attempt {attempt}/{len(RETRY_DELAYS)}: client error ({e.code})")
+                if e.code == 429:
+                    continue  # rate limit: wait and retry
+                if e.code in (401, 403):
+                    # Bad/blocked key: no model will work, stop immediately.
+                    raise
+                break  # 400/404 etc: this model won't work, try the next one
+
             except Exception as e:
                 last_error = e
-                print(f"Gemini call failed ({model_name}, attempt {attempt + 1}/2): {e}")
-                if attempt < 1:
-                    time.sleep(20)
+                print(f"{model_name} attempt {attempt}/{len(RETRY_DELAYS)}: unexpected error: {e}")
 
     raise last_error
 
-def send_email(body, for_date):
-    html = f"<pre style='font-family: Arial; white-space: pre-wrap;'>{body}</pre>"
-    msg = MIMEText(html, 'html')
-    msg['Subject'] = f"SSB Defence Brief - {for_date.strftime('%d %b %Y')}"
+def build_fallback_brief(relevant, for_date, error):
+    """Used only when Gemini stays unavailable: still send the user the
+    filtered headlines + links so the morning mail is never empty."""
+    lines = [
+        f"AI summary unavailable today ({type(error).__name__}). "
+        f"Here are the top filtered headlines for {for_date.strftime('%d %B %Y')} instead:",
+        "",
+    ]
+    if not relevant:
+        lines.append("No matching articles were found for this date.")
+    for i, a in enumerate(relevant, 1):
+        lines.append(f"{i}. [{a['source']}] {a['title']}")
+        lines.append(f"   {a['link']}")
+        lines.append("")
+    return "\n".join(lines)
+
+def send_email(body, for_date, subject_prefix="SSB Defence Brief"):
+    safe_body = html.escape(body)
+    page = f"<pre style='font-family: Arial; white-space: pre-wrap;'>{safe_body}</pre>"
+    msg = MIMEText(page, 'html')
+    msg['Subject'] = f"{subject_prefix} - {for_date.strftime('%d %b %Y')}"
     msg['From'] = os.getenv("EMAIL")
     msg['To'] = os.getenv("EMAIL")
 
@@ -233,6 +278,23 @@ def send_email(body, for_date):
 if __name__ == "__main__":
     target_date = get_target_date_ist()
     articles = get_news_articles()
-    news_text = build_news_text(articles)
-    brief = summarize(news_text, target_date)
-    send_email(brief, target_date)
+    relevant = select_relevant(articles)
+
+    if not relevant:
+        send_email(
+            "No articles were found for this date from any feed.",
+            target_date,
+            subject_prefix="SSB Defence Brief (no news)"
+        )
+    else:
+        news_text = build_news_text(relevant)
+        try:
+            brief = summarize(news_text, target_date)
+            send_email(brief, target_date)
+        except Exception as exc:
+            print(f"Gemini failed completely, sending headlines only: {exc}")
+            send_email(
+                build_fallback_brief(relevant, target_date, exc),
+                target_date,
+                subject_prefix="SSB Defence Brief (headlines only)"
+            )
